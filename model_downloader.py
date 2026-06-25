@@ -1,26 +1,39 @@
 import os
 import urllib.request
 import sys
-from config import MODELS_DIR, FACE_DETECT_PROTOTXT, FACE_DETECT_MODEL, FACE_ENCODING_MODEL
+from config import MODELS_DIR
 
 
-FACE_DETECT_PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-FACE_DETECT_MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20180205_fp16/res10_300x300_ssd_iter_140000_fp16.caffemodel"
-FACE_ENCODING_MODEL_URL = "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
+MODELS = [
+    {
+        "name": "YuNet Face Detector",
+        "url": "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        "path": os.path.join(MODELS_DIR, "yunet_2023mar.onnx"),
+    },
+    {
+        "name": "SFace Recognition",
+        "url": "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+        "path": os.path.join(MODELS_DIR, "sface_2021dec.onnx"),
+    },
+    {
+        "name": "YOLOv8n Object Detection",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.onnx",
+        "path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n.onnx"),
+    },
+]
 
 
 def download_file(url, filepath, description):
     if os.path.exists(filepath):
-        print(f"  [OK] {description} already exists.")
+        print(f"  [OK] {description}")
         return True
     try:
         print(f"  Downloading {description}...")
-        print(f"  URL: {url}")
         urllib.request.urlretrieve(url, filepath, reporthook=_progress_hook)
-        print(f"\n  [OK] {description} downloaded successfully.")
+        print(f"\n  [OK] {description} done")
         return True
     except Exception as e:
-        print(f"\n  [ERROR] Failed to download {description}: {e}")
+        print(f"\n  [ERROR] {description}: {e}")
         return False
 
 
@@ -28,39 +41,28 @@ def _progress_hook(block_num, block_size, total_size):
     downloaded = block_num * block_size
     if total_size > 0:
         percent = min(100, (downloaded / total_size) * 100)
-        bar_len = 40
+        bar_len = 30
         filled = int(bar_len * percent / 100)
         bar = "=" * filled + "-" * (bar_len - filled)
-        sys.stdout.write(f"\r  [{bar}] {percent:.1f}% ({downloaded // 1024 // 1024}MB/{total_size // 1024 // 1024}MB)")
+        sys.stdout.write(f"\r  [{bar}] {percent:.0f}%")
         sys.stdout.flush()
 
 
 def download_all_models():
-    print("=" * 60)
+    print("=" * 50)
     print("  MODEL DOWNLOADER")
-    print("=" * 60)
-
+    print("=" * 50)
     os.makedirs(MODELS_DIR, exist_ok=True)
-
     results = []
-
-    print("\n[1/3] Face Detection Prototxt...")
-    results.append(download_file(FACE_DETECT_PROTOTXT_URL, FACE_DETECT_PROTOTXT, "deploy.prototxt"))
-
-    print("\n[2/3] Face Detection Model (Caffe)...")
-    results.append(download_file(FACE_DETECT_MODEL_URL, FACE_DETECT_MODEL, "res10_300x300_ssd_iter_140000.caffemodel"))
-
-    print("\n[3/3] Face Encoding Model (OpenFace)...")
-    results.append(download_file(FACE_ENCODING_MODEL_URL, FACE_ENCODING_MODEL, "openface_nn4.small2.v2.t7"))
-
-    print("\n" + "=" * 60)
+    for i, m in enumerate(MODELS, 1):
+        print(f"\n[{i}/{len(MODELS)}] {m['name']}...")
+        results.append(download_file(m["url"], m["path"], m["name"]))
+    print("\n" + "=" * 50)
     if all(results):
-        print("  ALL MODELS DOWNLOADED SUCCESSFULLY!")
+        print("  ALL MODELS READY!")
     else:
-        print("  SOME MODELS FAILED TO DOWNLOAD.")
-        print("  Check your internet connection and try again.")
-    print("=" * 60)
-
+        print("  SOME FAILED - check internet")
+    print("=" * 50)
     return all(results)
 
 

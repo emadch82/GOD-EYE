@@ -6,7 +6,12 @@ ai_core/target/
 ai_core/.git/
 face_database/
 captured_faces/
+logs/
 yolov8n.pt
+yolov8m.pt
+yolov8m.onnx
 *.pkl
 *.log
 .env
+*.avi
+*.mp4
