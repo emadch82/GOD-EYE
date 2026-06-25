@@ -1,0 +1,9 @@
+# AI Vision System Configuration
+# Edit these settings as needed
+
+CAMERA_INDEX = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+FACE_DETECT_CONFIDENCE = 0.5
+FACE_RECOGNITION_TOLERANCE = 0.5
+YOLO_CONFIDENCE = 0.25

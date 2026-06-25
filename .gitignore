@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyd
+*.dll
+ai_core/target/
+ai_core/.git/
+face_database/
+captured_faces/
+yolov8n.pt
+*.pkl
+*.log
+.env
