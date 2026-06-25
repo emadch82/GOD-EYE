@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="GOD EYE" width="200"/>
+  <img src="logo.png" alt="GOD EYE" width="800"/>
 </p>
 
 <h1 align="center">GOD EYE — سیستم بینایی ماشین</h1>
