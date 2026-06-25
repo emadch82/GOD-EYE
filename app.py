@@ -5,6 +5,7 @@ import customtkinter as ctk
 from tkinter import messagebox, filedialog
 from PIL import Image, ImageTk
 from datetime import datetime
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
@@ -91,6 +92,143 @@ class ObjDet:
                 detections.append({"bbox": (x1, y1, x2, y2), "name": name, "confidence": conf})
         self.last_results = detections
         return detections
+
+
+PLATE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "plates.onnx")
+PLATE_CAPTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captured_plates")
+
+
+class PlateDetector:
+    def __init__(self):
+        self.net = None
+        self.initialized = False
+        self.ocr = None
+        self.frame_count = 0
+        self.last_results = []
+        self._saved_plates = set()
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(PLATE_MODEL):
+            print("[PlateDetector] plates.onnx not found")
+            return
+        try:
+            self.net = cv2.dnn.readNetFromONNX(PLATE_MODEL)
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            print("[PlateDetector] License plate model loaded")
+            self.initialized = True
+        except Exception as e:
+            print(f"[PlateDetector] Load error: {e}")
+        threading.Thread(target=self._init_ocr, daemon=True).start()
+
+    def _init_ocr(self):
+        if self.ocr is not None:
+            return
+        try:
+            import easyocr
+            self.ocr = easyocr.Reader(['fa', 'en'], gpu=False, verbose=False)
+            print("[PlateDetector] EasyOCR loaded (Persian + English)")
+        except Exception as e:
+            print(f"[PlateDetector] OCR error: {e}")
+
+    def detect(self, frame, skip=3):
+        self.frame_count += 1
+        if self.frame_count % skip != 0:
+            return self.last_results
+        if self.net is None:
+            return []
+
+        h, w = frame.shape[:2]
+        inp_size = 640
+        inp = cv2.resize(frame, (inp_size, inp_size))
+        blob = cv2.dnn.blobFromImage(inp, 1.0 / 255.0, (inp_size, inp_size), swapRB=True)
+        self.net.setInput(blob)
+        out = self.net.forward()
+        out2 = out.squeeze(0).T
+
+        detections = []
+        sx, sy = w / inp_size, h / inp_size
+        for row in out2:
+            conf = float(row[4])
+            if conf < 0.3:
+                continue
+            cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+            x1 = max(0, int((cx - bw / 2) * sx))
+            y1 = max(0, int((cy - bh / 2) * sy))
+            x2 = min(w, int((cx + bw / 2) * sx))
+            y2 = min(h, int((cy + bh / 2) * sy))
+            if x2 - x1 < 20 or y2 - y1 < 10:
+                continue
+
+            plate_text = ""
+            if self.ocr is not None:
+                plate_crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                if plate_crop.size > 0:
+                    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    gray = clahe.apply(gray)
+                    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                    results = self.ocr.readtext(gray, detail=0, paragraph=True)
+                    plate_text = " ".join(results).strip()
+                    plate_text = self._clean_plate_text(plate_text)
+
+            detections.append({
+                "bbox": (x1, y1, x2, y2),
+                "confidence": conf,
+                "text": plate_text,
+            })
+
+        self.last_results = detections
+        return detections
+
+    def _clean_plate_text(self, text):
+        persian_map = {
+            'a': 'الف', 'b': 'ب', 'p': 'پ', 't': 'ت', 's': 'ث',
+            'j': 'ج', 'ch': 'چ', 'h': 'ح', 'kh': 'خ', 'd': 'د',
+            'z': 'ذ', 'r': 'ر', 'zh': 'ژ', 's2': 'س', 'sh': 'ش',
+            's3': 'ص', 'z2': 'ض', 't2': 'ظ', 'z3': 'ظ', 'eyn': 'ع',
+            'gh': 'غ', 'f': 'ف', 'gh2': 'ق', 'k': 'ک', 'g': 'گ',
+            'l': 'ل', 'm': 'م', 'n': 'ن', 'v': 'و', 'h2': 'ه', 'y': 'ی',
+        }
+        text = text.replace(" ", "")
+        text = text.upper()
+        return text
+
+    def save_plate(self, frame, bbox, plate_text):
+        if not plate_text or len(plate_text) < 4:
+            return
+        if plate_text in self._saved_plates:
+            return
+        self._saved_plates.add(plate_text)
+        if len(self._saved_plates) > 500:
+            self._saved_plates = set(list(self._saved_plates)[-250:])
+
+        try:
+            os.makedirs(PLATE_CAPTURES_DIR, exist_ok=True)
+            x1, y1, x2, y2 = bbox
+            h, w = frame.shape[:2]
+            pad = 15
+            crop = frame[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{plate_text}_{ts}.jpg"
+            filepath = os.path.join(PLATE_CAPTURES_DIR, filename)
+            cv2.imwrite(filepath, crop)
+
+            log_path = os.path.join(PLATE_CAPTURES_DIR, "plates_log.json")
+            log_entry = {"plate": plate_text, "time": ts, "file": filename}
+            logs = []
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8") as f:
+                        logs = json.load(f)
+                except:
+                    logs = []
+            logs.append(log_entry)
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[PlateDetector] Save error: {e}")
 
 
 SFACE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sface_2021dec.onnx")
@@ -238,13 +376,13 @@ class App(ctk.CTk):
         super().__init__()
         tag = "RUST" if RUST else "PYTHON"
         self.title("AI Vision Pro")
-        self.geometry("1920x1080")
         self.configure(fg_color="#0d1117")
 
         self.webcam = None
         self.face_det = None
         self.face_enc = None
         self.obj_det = None
+        self.plate_det = None
         self.running = False
         self.paused = False
         self.known_encodings = []
@@ -279,6 +417,7 @@ class App(ctk.CTk):
         self.zoom_level = 1.0
         self.zoom_center = None
         self._is_fullscreen = False
+        self._people_win = None
         self._sidebar_ref = None
         self.people_count = 0
         self.people_max = 0
@@ -290,7 +429,7 @@ class App(ctk.CTk):
         self._det_thread_running = False
         self._det_result_faces = []
         self._det_result_objects = []
-        self._det_frame = None
+        self._det_result_plates = []
         self._det_lock = threading.Lock()
         self.smart_zoom = False
         self.zone_alert = False
@@ -392,12 +531,16 @@ class App(ctk.CTk):
 
         self.face_var = ctk.BooleanVar(value=True)
         self.obj_var = ctk.BooleanVar(value=True)
+        self.plate_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(sidebar, text="Face Detection", variable=self.face_var,
                       font=ctk.CTkFont(size=11), text_color="#c9d1d9",
                       fg_color="#30363d", progress_color="#58a6ff").pack(padx=10, anchor="w", pady=1)
         ctk.CTkSwitch(sidebar, text="Object Detection", variable=self.obj_var,
                       font=ctk.CTkFont(size=11), text_color="#c9d1d9",
                       fg_color="#30363d", progress_color="#58a6ff").pack(padx=10, anchor="w", pady=1)
+        ctk.CTkSwitch(sidebar, text="License Plate", variable=self.plate_var,
+                      font=ctk.CTkFont(size=11), text_color="#c9d1d9",
+                      fg_color="#30363d", progress_color="#f0883e").pack(padx=10, anchor="w", pady=1)
         self.enhanced_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(sidebar, text="Enhanced Detect", variable=self.enhanced_var,
                       font=ctk.CTkFont(size=11), text_color="#c9d1d9",
@@ -492,12 +635,6 @@ class App(ctk.CTk):
                       fg_color="#30363d", progress_color="#da3633",
                       command=self._toggle_heatmap).pack(padx=10, anchor="w", pady=1)
 
-        self.multi_var = ctk.BooleanVar(value=False)
-        ctk.CTkSwitch(sidebar, text="Multi Camera", variable=self.multi_var,
-                      font=ctk.CTkFont(size=11), text_color="#c9d1d9",
-                      fg_color="#30363d", progress_color="#1f6feb",
-                      command=self._toggle_multi).pack(padx=10, anchor="w", pady=1)
-
         ctk.CTkFrame(sidebar, height=1, fg_color="#30363d").pack(fill="x", padx=10, pady=4)
 
         self.smart_zoom_var = ctk.BooleanVar(value=False)
@@ -573,6 +710,12 @@ class App(ctk.CTk):
                                          corner_radius=8, padx=12, pady=6)
         self.stat_objects.pack(side="left", padx=6, pady=10)
 
+        self.stat_plates = ctk.CTkLabel(bottom, text="Plates: 0",
+                                         font=ctk.CTkFont(size=14, weight="bold"),
+                                         text_color="#f0883e", fg_color="#0d1117",
+                                         corner_radius=8, padx=12, pady=6)
+        self.stat_plates.pack(side="left", padx=6, pady=10)
+
         self.s_info = ctk.CTkLabel(bottom, text="",
                                    font=ctk.CTkFont(size=11),
                                    text_color="#8b949e")
@@ -597,6 +740,10 @@ class App(ctk.CTk):
                 self.obj_det = ObjDet()
             except Exception as e:
                 print("Object detector error:", e)
+            try:
+                self.plate_det = PlateDetector()
+            except Exception as e:
+                print("Plate detector error:", e)
             self.ready = True
             self.after(0, lambda: self.status_badge.configure(
                 text=f"Ready [{('RUST' if RUST else 'PYTHON')}]",
@@ -610,11 +757,21 @@ class App(ctk.CTk):
             messagebox.showinfo("Wait", "Models still loading...")
             return
         self.latest_frame = None
-        self.webcam = cv2.VideoCapture(CAMERA_INDEX)
-        self.webcam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        self.webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        self.webcam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.webcam.isOpened():
+        self.webcam = None
+        for attempt in range(3):
+            self.webcam = cv2.VideoCapture(CAMERA_INDEX)
+            self.webcam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+            self.webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+            self.webcam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if self.webcam.isOpened():
+                ret, _ = self.webcam.read()
+                if ret:
+                    break
+            if self.webcam:
+                self.webcam.release()
+                self.webcam = None
+            time.sleep(0.3)
+        if not self.webcam or not self.webcam.isOpened():
             messagebox.showerror("Error", "Camera not available!")
             self.webcam = None
             return
@@ -629,6 +786,7 @@ class App(ctk.CTk):
         self.prev_frame_gray = None
         self._det_result_faces = []
         self._det_result_objects = []
+        self._det_result_plates = []
         if self.heatmap_data is not None:
             self.heatmap_data *= 0
         self.status_badge.configure(text="REC", fg_color="#da3633", text_color="#ffffff")
@@ -655,7 +813,7 @@ class App(ctk.CTk):
                 with self.lock:
                     frame = self.latest_frame
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
                 faces = []
                 objects = []
@@ -669,16 +827,22 @@ class App(ctk.CTk):
                         objects = self.obj_det.detect(frame, skip=1)
                     except:
                         pass
+                plates = []
+                if self.plate_var.get() and self.plate_det and self.plate_det.initialized:
+                    try:
+                        plates = self.plate_det.detect(frame, skip=3)
+                    except:
+                        pass
                 with self._det_lock:
                     self._det_result_faces = faces
                     self._det_result_objects = objects
+                    self._det_result_plates = plates
             except:
                 pass
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     def _stop(self):
         self.running = False
-        time.sleep(0.05)
         if self.webcam:
             try:
                 self.webcam.release()
@@ -701,14 +865,15 @@ class App(ctk.CTk):
         self._counted_ids = set()
         self._prev_faces_y = {}
         self._enc_cache = {}
+        self.photo = None
         self.status_badge.configure(text="STOPPED", fg_color="#da3633", text_color="#ffffff")
         self.canvas_label.configure(image=None, text="Camera Off")
         self.stat_fps.configure(text="FPS: --")
         self.stat_faces.configure(text="Faces: 0")
         self.stat_objects.configure(text="Objects: 0")
+        self.stat_plates.configure(text="Plates: 0")
         self.stat_people_live.configure(text="People: 0")
         self.stat_people_max.configure(text="Max: 0")
-        self.stat_people_total.configure(text="Total: 0")
         self.stat_people_total.configure(text="Total: 0")
 
     def _pause(self):
@@ -783,6 +948,7 @@ class App(ctk.CTk):
         with self._det_lock:
             faces = list(self._det_result_faces)
             objects = list(self._det_result_objects)
+            plates = list(self._det_result_plates)
 
         face_infos = []
         unknown_bboxes = []
@@ -882,6 +1048,28 @@ class App(ctk.CTk):
             cv2.putText(frame, label, (x1 + 3, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
+        for p in plates:
+            px1, py1, px2, py2 = p["bbox"]
+            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 165, 255), 2)
+            corner = 10
+            cv2.line(frame, (px1, py1), (px1 + corner, py1), (0, 165, 255), 3)
+            cv2.line(frame, (px1, py1), (px1, py1 + corner), (0, 165, 255), 3)
+            cv2.line(frame, (px2, py1), (px2 - corner, py1), (0, 165, 255), 3)
+            cv2.line(frame, (px2, py1), (px2, py1 + corner), (0, 165, 255), 3)
+            cv2.line(frame, (px1, py2), (px1 + corner, py2), (0, 165, 255), 3)
+            cv2.line(frame, (px1, py2), (px1, py2 - corner), (0, 165, 255), 3)
+            cv2.line(frame, (px2, py2), (px2 - corner, py2), (0, 165, 255), 3)
+            cv2.line(frame, (px2, py2), (px2, py2 - corner), (0, 165, 255), 3)
+            plate_label = "PLATE"
+            if p["text"]:
+                plate_label = p["text"]
+            (tw, th), _ = cv2.getTextSize(plate_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (px1, py1 - th - 10), (px1 + tw + 8, py1), (0, 165, 255), -1)
+            cv2.putText(frame, plate_label, (px1 + 4, py1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+            if p["text"]:
+                self.plate_det.save_plate(frame, p["bbox"], p["text"])
+
         if self.motion_detected:
             cv2.putText(frame, "MOTION DETECTED", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -974,7 +1162,7 @@ class App(ctk.CTk):
         self.photo = ImageTk.PhotoImage(pil)
         self.canvas_label.configure(image=self.photo, text="")
 
-        self.after(0, lambda: self._update_stats(fps, len(faces), len(objects)))
+        self.after(0, lambda: self._update_stats(fps, len(faces), len(objects), len(plates)))
 
         face_key = str([(f["name"], f["known"], i) for i, f in enumerate(face_infos)])
         if face_key != self.last_face_key:
@@ -983,10 +1171,11 @@ class App(ctk.CTk):
 
         self.after(15, self._loop)
 
-    def _update_stats(self, fps, face_count, obj_count):
+    def _update_stats(self, fps, face_count, obj_count, plate_count=0):
         self.stat_fps.configure(text="FPS: {:.0f}".format(fps))
         self.stat_faces.configure(text="Faces: {}".format(face_count))
         self.stat_objects.configure(text="Objects: {}".format(obj_count))
+        self.stat_plates.configure(text="Plates: {}".format(plate_count))
         self.stat_people_live.configure(text="People: {}".format(self.people_count))
         self.stat_people_max.configure(text="Max: {}".format(self.people_max))
         self.stat_people_total.configure(text="Total: {}".format(self.people_total))
@@ -1216,10 +1405,20 @@ class App(ctk.CTk):
         if not self.known_names:
             messagebox.showinfo("People", "No people saved.")
             return
+        if hasattr(self, '_people_win') and self._people_win is not None:
+            try:
+                if self._people_win.winfo_exists():
+                    self._people_win.lift()
+                    self._people_win.focus_force()
+                    return
+            except:
+                pass
         win = ctk.CTkToplevel(self)
+        self._people_win = win
         win.title("People Database")
-        win.geometry("420x450")
+        win.geometry("450x520")
         win.configure(fg_color="#0d1117")
+        win.after(10, lambda: None)
 
         ctk.CTkLabel(win, text="PEOPLE DATABASE",
                      font=ctk.CTkFont(size=14, weight="bold"),
@@ -1229,26 +1428,139 @@ class App(ctk.CTk):
                                         scrollbar_button_color="#30363d")
         scroll.pack(fill="both", expand=True, padx=15, pady=5)
 
-        for n in self.known_names:
-            p = self.profiles.get(n, {})
-            card = ctk.CTkFrame(scroll, fg_color="#161b22", corner_radius=8,
-                                border_width=1, border_color="#30363d")
-            card.pack(fill="x", pady=3, padx=2)
+        def rebuild_list():
+            for w in scroll.winfo_children():
+                w.destroy()
+            for n in self.known_names:
+                p = self.profiles.get(n, {})
+                card = ctk.CTkFrame(scroll, fg_color="#161b22", corner_radius=8,
+                                    border_width=1, border_color="#30363d")
+                card.pack(fill="x", pady=3, padx=2)
 
-            ctk.CTkLabel(card, text=n, font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color="#e6edf3", anchor="w").pack(fill="x", padx=12, pady=(8, 2))
+                top = ctk.CTkFrame(card, fg_color="transparent")
+                top.pack(fill="x", padx=12, pady=(8, 0))
 
-            parts = []
-            if p.get("age"):
-                parts.append("Age: {}".format(p["age"]))
-            if p.get("job"):
-                parts.append(p["job"])
-            if p.get("desc"):
-                parts.append(p["desc"])
-            if parts:
-                ctk.CTkLabel(card, text=" | ".join(parts),
-                             font=ctk.CTkFont(size=10),
-                             text_color="#8b949e", anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+                ctk.CTkLabel(top, text=n, font=ctk.CTkFont(size=13, weight="bold"),
+                             text_color="#e6edf3", anchor="w").pack(side="left")
+
+                btn_row = ctk.CTkFrame(top, fg_color="transparent")
+                btn_row.pack(side="right")
+
+                def make_edit(name=n):
+                    return lambda: _edit_person(name)
+                def make_delete(name=n):
+                    return lambda: _delete_person(name)
+
+                ctk.CTkButton(btn_row, text="Edit", width=50, height=28,
+                              fg_color="#1f6feb", hover_color="#388bfd",
+                              font=ctk.CTkFont(size=11), corner_radius=6,
+                              command=make_edit()).pack(side="left", padx=(0, 4))
+                ctk.CTkButton(btn_row, text="Del", width=50, height=28,
+                              fg_color="#da3633", hover_color="#f85149",
+                              font=ctk.CTkFont(size=11), corner_radius=6,
+                              command=make_delete()).pack(side="left")
+
+                parts = []
+                if p.get("age"):
+                    parts.append("Age: {}".format(p["age"]))
+                if p.get("job"):
+                    parts.append(p["job"])
+                if p.get("desc"):
+                    parts.append(p["desc"])
+                if parts:
+                    ctk.CTkLabel(card, text=" | ".join(parts),
+                                 font=ctk.CTkFont(size=10),
+                                 text_color="#8b949e", anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+
+        def _delete_person(name):
+            if not messagebox.askyesno("Delete", "Delete '{}'?".format(name), parent=win):
+                return
+            idx = self.known_names.index(name)
+            self.known_names.pop(idx)
+            self.known_encodings.pop(idx)
+            if name in self.profiles:
+                del self.profiles[name]
+            self._save_data()
+            rebuild_list()
+
+        def _edit_person(name):
+            ew = ctk.CTkToplevel(win)
+            ew.title("Edit - " + name)
+            ew.geometry("350x380")
+            ew.configure(fg_color="#0d1117")
+
+            ctk.CTkLabel(ew, text="EDIT PROFILE",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color="#58a6ff").pack(pady=(15, 10))
+
+            p = self.profiles.get(name, {})
+            fields = {}
+            for label, key, default in [
+                ("ID (fixed):", "id", name),
+                ("Name:", "name", p.get("name", "")),
+                ("Age:", "age", p.get("age", "")),
+                ("Job:", "job", p.get("job", "")),
+                ("Description:", "desc", p.get("desc", "")),
+            ]:
+                row = ctk.CTkFrame(ew, fg_color="transparent")
+                row.pack(fill="x", padx=25, pady=3)
+                ctk.CTkLabel(row, text=label, font=ctk.CTkFont(size=11),
+                             text_color="#8b949e", width=90, anchor="w").pack(side="left")
+                entry = ctk.CTkEntry(row, font=ctk.CTkFont(size=12),
+                                     fg_color="#161b22", border_color="#30363d",
+                                     text_color="#e6edf3")
+                entry.pack(side="left", fill="x", expand=True)
+                entry.insert(0, default)
+                if key == "id":
+                    entry.configure(state="disabled")
+                fields[key] = (entry, default)
+
+            def save_edit():
+                new_id = name
+                new_name = fields["name"][1].strip() if not fields["name"][0].get().strip() else fields["name"][0].get().strip()
+                new_age = fields["age"][0].get().strip()
+                new_job = fields["job"][0].get().strip()
+                new_desc = fields["desc"][0].get().strip()
+
+                if new_name and new_name != name:
+                    if new_name in self.known_names:
+                        messagebox.showerror("Error", "Name '{}' already exists!".format(new_name), parent=ew)
+                        return
+                    idx = self.known_names.index(name)
+                    self.known_names[idx] = new_name
+                    if name in self.profiles:
+                        self.profiles[new_name] = self.profiles.pop(name)
+                    new_id = new_name
+
+                if new_id in self.profiles:
+                    self.profiles[new_id]["name"] = new_name
+                    self.profiles[new_id]["age"] = new_age
+                    self.profiles[new_id]["job"] = new_job
+                    self.profiles[new_id]["desc"] = new_desc
+                else:
+                    self.profiles[new_id] = {
+                        "name": new_name, "age": new_age,
+                        "job": new_job, "desc": new_desc,
+                    }
+
+                self._save_data()
+                rebuild_list()
+                ew.destroy()
+                messagebox.showinfo("Saved", "Profile updated!", parent=win)
+
+            btn_frame = ctk.CTkFrame(ew, fg_color="transparent")
+            btn_frame.pack(fill="x", padx=25, pady=20)
+
+            ctk.CTkButton(btn_frame, text="SAVE", height=36,
+                          fg_color="#238636", hover_color="#2ea043",
+                          font=ctk.CTkFont(size=12), corner_radius=8,
+                          command=save_edit).pack(side="left", expand=True, fill="x", padx=(0, 5))
+            ctk.CTkButton(btn_frame, text="CANCEL", height=36,
+                          fg_color="#30363d", hover_color="#484f58",
+                          font=ctk.CTkFont(size=12), corner_radius=8,
+                          command=ew.destroy).pack(side="right", expand=True, fill="x", padx=(5, 0))
+
+        rebuild_list()
 
         ctk.CTkButton(win, text="CLOSE", height=36,
                       fg_color="#30363d", hover_color="#484f58",
@@ -1354,10 +1666,9 @@ class App(ctk.CTk):
     def _toggle_fullscreen(self):
         self._is_fullscreen = not self._is_fullscreen
         if self._is_fullscreen:
-            self.state("zoomed")
+            self.after(100, lambda: (self.state("zoomed"), self.update_idletasks()))
         else:
             self.state("normal")
-            self.geometry("1920x1080")
 
     def _toggle_line(self):
         self.line_crossing_enabled = self.line_var.get()

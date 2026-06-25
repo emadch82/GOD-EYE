@@ -6,6 +6,7 @@ ai_core/target/
 ai_core/.git/
 face_database/
 captured_faces/
+captured_plates/
 logs/
 yolov8n.pt
 yolov8m.pt

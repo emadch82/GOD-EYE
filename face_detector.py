@@ -16,7 +16,7 @@ class FaceDetector:
         self._contrast_enhance = False
         self._frame_count = 0
         self._cached_faces = []
-        self._cache_interval = 4
+        self._cache_interval = 1
         self._load()
 
     def _load(self):
